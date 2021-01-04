@@ -1,20 +1,26 @@
 package me.devnatan.katan.api
 
+/**
+ * Represents the platform in which Katan is running.
+ * @property os operating system information.
+ */
 data class Platform(val os: OS) {
 
     /**
      * Platform operational system info.
-     * @property name the name of the operating system
-     * @property arch the operating system architecture information
-     * @property version the operating system version
+     * @property name the name of the operating system.
+     * @property arch the operating system architecture information.
+     * @property version the operating system version.
      */
     data class OS(val name: String, val arch: String, val version: String) {
 
         override fun toString(): String {
-            return "$name $version ($arch)"
+            return "$name v$version ($arch)"
         }
 
     }
+
+    override fun toString() = os.toString()
 
 }
 
@@ -39,9 +45,8 @@ fun Platform.isLinux(): Boolean {
  * @see Platform.OS
  */
 fun Platform.isMac(): Boolean {
-    return os.name.let {
-        it.startsWith("mac") || it.startsWith("darwin")
-    }
+    val name = os.name.toLowerCase()
+    return name.startsWith("mac") || name.startsWith("darwin")
 }
 
 /**
@@ -67,6 +72,14 @@ fun currentPlatform() = Platform(
     Platform.OS(
         System.getProperty("os.name"),
         System.getProperty("os.arch"),
-        System.getProperty("os.version", "")
+        System.getProperty("os.version", "unknown")
     )
 )
+
+/**
+ * Clears the console screen according to the current platform.
+ */
+fun Platform.clearConsole() {
+    if (isWindows()) ProcessBuilder("cmd", "/c", "cls").inheritIO().start().waitFor();
+    else Runtime.getRuntime().exec("clear");
+}

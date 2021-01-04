@@ -1,8 +1,6 @@
 package me.devnatan.katan.core
 
 import br.com.devsrsouza.eventkt.EventScope
-import br.com.devsrsouza.eventkt.scopes.LocalEventScope
-import br.com.devsrsouza.eventkt.scopes.SimpleEventScope
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.github.dockerjava.api.DockerClient
 import com.github.dockerjava.core.DefaultDockerClientConfig
@@ -13,114 +11,98 @@ import com.github.dockerjava.okhttp.OkDockerHttpClient
 import com.typesafe.config.Config
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
-import me.devnatan.katan.api.Katan
-import me.devnatan.katan.api.KatanEnvironment
-import me.devnatan.katan.api.Platform
+import me.devnatan.katan.api.*
+import me.devnatan.katan.api.annotations.UnstableKatanApi
 import me.devnatan.katan.api.cache.Cache
 import me.devnatan.katan.api.cache.UnavailableCacheProvider
-import me.devnatan.katan.api.currentPlatform
-import me.devnatan.katan.api.manager.AccountManager
-import me.devnatan.katan.api.manager.PluginManager
+import me.devnatan.katan.api.cli.CommandManager
+import me.devnatan.katan.api.game.GameManager
+import me.devnatan.katan.api.plugin.KatanInit
+import me.devnatan.katan.api.plugin.KatanStarted
+import me.devnatan.katan.api.security.crypto.Hash
+import me.devnatan.katan.api.security.permission.DefaultPermissionKeys
+import me.devnatan.katan.api.service.get
 import me.devnatan.katan.common.util.get
 import me.devnatan.katan.core.cache.RedisCacheProvider
 import me.devnatan.katan.core.crypto.BcryptHash
-import me.devnatan.katan.core.crypto.Hash
-import me.devnatan.katan.core.database.DatabaseConnector
-import me.devnatan.katan.core.database.SUPPORTED_CONNECTORS
+import me.devnatan.katan.core.database.DatabaseManager
 import me.devnatan.katan.core.database.jdbc.JDBCConnector
-import me.devnatan.katan.core.exceptions.throwSilent
-import me.devnatan.katan.core.manager.DefaultAccountManager
-import me.devnatan.katan.core.manager.DefaultPluginManager
-import me.devnatan.katan.core.manager.DockerServerManager
+import me.devnatan.katan.core.docker.DockerEventsListener
+import me.devnatan.katan.core.impl.account.AccountManagerImpl
+import me.devnatan.katan.core.impl.cli.CommandManagerImpl
+import me.devnatan.katan.core.impl.game.GameManagerImpl
+import me.devnatan.katan.core.impl.permission.PermissionManagerImpl
+import me.devnatan.katan.core.impl.plugin.DefaultPluginManager
+import me.devnatan.katan.core.impl.server.DockerServerManager
+import me.devnatan.katan.core.impl.services.ServiceManagerImpl
 import me.devnatan.katan.core.repository.JDBCAccountsRepository
 import me.devnatan.katan.core.repository.JDBCServersRepository
+import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import redis.clients.jedis.JedisPool
 import redis.clients.jedis.JedisPoolConfig
-import java.io.UncheckedIOException
-import java.net.ConnectException
 import java.security.KeyStore
-import kotlin.system.measureTimeMillis
+import java.util.*
+import kotlin.system.exitProcess
 
-class KatanCore(
-    private val config: Config,
-    override val environment: KatanEnvironment,
-    val locale: KatanLocale
-) :
-    CoroutineScope by CoroutineScope(CoroutineName("Katan")), Katan {
+@OptIn(UnstableKatanApi::class)
+class KatanCore(val config: Config, override val environment: KatanEnvironment, override val translator: Translator) :
+    Katan, CoroutineScope by CoroutineScope(CoroutineName("Katan")) {
 
     companion object {
 
         const val DATABASE_DIALECT_FALLBACK = "H2"
-        val logger = LoggerFactory.getLogger(Katan::class.java)!!
+        const val DEFAULT_VALUE = "default"
+        val logger: Logger = LoggerFactory.getLogger(Katan::class.java)
 
     }
 
+    val objectMapper = ObjectMapper()
     override val platform: Platform = currentPlatform()
-    lateinit var database: DatabaseConnector
     lateinit var docker: DockerClient
-    override lateinit var accountManager: AccountManager
+    override lateinit var accountManager: AccountManagerImpl
     override lateinit var serverManager: DockerServerManager
-    override lateinit var pluginManager: PluginManager
+    override val pluginManager = DefaultPluginManager(this)
+    override val serviceManager = ServiceManagerImpl()
+    override lateinit var gameManager: GameManager
     override lateinit var cache: Cache<Any>
-    override lateinit var eventBus: EventScope
+    override val eventBus: EventScope = EventBus()
     lateinit var hash: Hash
-    val objectMapper: ObjectMapper = ObjectMapper()
+    lateinit var databaseManager: DatabaseManager
+    override val permissionManager = PermissionManagerImpl()
+    private val dockerEventsListener = DockerEventsListener(this)
+    override val commandManager: CommandManager = CommandManagerImpl()
 
-    private suspend fun database() {
-        val db = config.getConfig("database")
-        val dialect = db.get("source", DATABASE_DIALECT_FALLBACK)
-        logger.info(locale["katan.database.dialect", dialect, DATABASE_DIALECT_FALLBACK])
-
-        val dialectSettings = runCatching {
-            db.getConfig(dialect.toLowerCase())
-        }.onFailure {
-            throwSilent(IllegalArgumentException("Dialect properties not found: $dialect."), logger)
-        }.getOrThrow()
-
-        connectWith(dialect, dialectSettings, db.get("strict", false))
-    }
-
-    private suspend fun connectWith(dialect: String, config: Config, strict: Boolean) {
-        val dialectName = dialect.toLowerCase()
-        if (!SUPPORTED_CONNECTORS.containsKey(dialectName))
-            throwSilent(IllegalArgumentException("Database dialect $dialect is not supported"), logger)
-
-        val (connector, settings) = SUPPORTED_CONNECTORS.getValue(dialectName).invoke(config)
-        logger.info(locale["katan.database.connector", connector::class.simpleName!!])
-
-        runCatching {
-            database = connector
-            logger.info(locale["katan.database.connecting", settings.toString()])
-            val took = measureTimeMillis {
-                connector.connect(settings)
-            }
-            logger.info(locale["katan.database.connected", String.format("%.2f", took / 1000.0f)])
-        }.onFailure {
-            logger.error(locale["katan.database.fail", dialect])
-            if (strict || dialect.equals(DATABASE_DIALECT_FALLBACK, true))
-                throwSilent(it, logger)
-
-            logger.info(locale["katan.database.strict", DATABASE_DIALECT_FALLBACK])
-            connectWith(DATABASE_DIALECT_FALLBACK, config, strict)
+    init {
+        val value = config.get("timezone", DEFAULT_VALUE)
+        if (value != DEFAULT_VALUE) {
+            val timezone = TimeZone.getTimeZone(value)
+            System.setProperty("katan.timezone", timezone.id)
+            logger.info(translator.translate("katan.timezone", timezone.displayName))
         }
     }
 
     private fun docker() {
-        logger.info(locale["katan.docker.config"])
-        val dockerLogger = LoggerFactory.getLogger(DockerClient::class.java)
+        logger.info(translator.translate("katan.docker.config"))
+        val dockerLogger = LoggerFactory.getLogger("Docker")
         val dockerConfig = config.getConfig("docker")
+        val host = System.getenv("KATAN_DOCKER_URI") ?: dockerConfig.getString("host")
+        if (host.startsWith("unix") && platform.isWindows()) {
+            logger.error(translator.translate("katan.docker.unix-domain-sockets", host))
+            exitProcess(0)
+        }
+
         val tls = dockerConfig.get("tls.verify", false)
         val clientConfig = DefaultDockerClientConfig.createDefaultConfigBuilder()
-            .withDockerHost(dockerConfig.getString("host"))
+            .withDockerHost(host)
             .withDockerTlsVerify(tls)
 
         if (tls) {
-            dockerLogger.info(locale["katan.docker.tls-enabled"])
+            dockerLogger.info(translator.translate("katan.docker.tls-enabled"))
             clientConfig.withDockerCertPath(dockerConfig.getString("tls.certPath"))
         } else
             dockerLogger.warn(
-                locale["katan.docker.tls-disabled", "https://docs.docker.com/engine/security/https/"]
+                translator.translate("katan.docker.tls-disabled", "https://docs.docker.com/engine/security/https/")
             )
 
         if (dockerConfig.get("ssl.enabled", false)) {
@@ -128,112 +110,97 @@ class KatanCore(
                 when (dockerConfig.getString("ssl.provider")) {
                     "CERT" -> {
                         val path = dockerConfig.getString("ssl.certPath")
-                        dockerLogger.info(locale["katan.docker.cert-loaded", path])
+                        dockerLogger.info(translator.translate("katan.docker.cert-loaded", path))
                         LocalDirectorySSLConfig(path)
                     }
                     "KEY_STORE" -> {
                         val type = dockerConfig.get("keyStore.provider") ?: KeyStore.getDefaultType()
                         val keystore = KeyStore.getInstance(type)
-                        dockerLogger.info(locale["katan.docker.ks-loaded", type])
+                        dockerLogger.info(translator.translate("katan.docker.ks-loaded", type))
 
                         KeystoreSSLConfig(keystore, dockerConfig.getString("keyStore.password"))
                     }
-                    else -> throwSilent(
-                        IllegalArgumentException("Unrecognized Docker SSL provider. Must be: CERT or KEY_STORE"),
-                        logger
-                    )
+                    else -> throw IllegalArgumentException("Unrecognized Docker SSL provider. Must be: CERT or KEY_STORE")
                 }
             )
         }
 
         val properties = dockerConfig.getConfig("properties")
         val httpConfig = clientConfig.build()
-
-        docker = runCatching {
-            DockerClientImpl.getInstance(
-                httpConfig, OkDockerHttpClient.Builder()
-                    .dockerHost(httpConfig.dockerHost)
-                    .sslConfig(httpConfig.sslConfig)
-                    .connectTimeout(properties.get("connectTimeout", 5000))
-                    .readTimeout(properties.get("readTimeout", 5000))
-                    .build()
-            )
-        }.onFailure {
-            throwSilent(it, dockerLogger)
-        }.getOrThrow()
+        docker = DockerClientImpl.getInstance(
+            httpConfig, OkDockerHttpClient.Builder()
+                .dockerHost(httpConfig.dockerHost)
+                .sslConfig(httpConfig.sslConfig)
+                .connectTimeout(properties.get("connectTimeout", 5000))
+                .readTimeout(properties.get("readTimeout", 5000))
+                .build()
+        )
 
         // sends a ping to see if the connection will be established.
-        try {
-            docker.pingCmd().exec()
-            dockerLogger.info(locale["katan.docker.ready"])
-        } catch (e: ConnectException) {
-            throwSilent(e, dockerLogger)
-        } catch (e: UncheckedIOException) {
-            throwSilent(e.cause!!, dockerLogger)
-        }
+        docker.pingCmd().exec()
+        dockerLogger.info(translator.translate("katan.docker.ready"))
     }
 
     private fun caching() {
         val redis = config.getConfig("redis")
         if (!redis.get("use", false)) {
-            logger.warn(locale["katan.redis.disabled"])
-            logger.warn(locale["katan.redis.alert", "https://redis.io/"])
+            logger.warn(translator.translate("katan.redis.disabled"))
+            logger.warn(translator.translate("katan.redis.alert", "https://redis.io/"))
             return
         }
-
-        val host = redis.get("host", "localhost")
-        logger.info(locale["katan.redis.host-info", host])
 
         try {
             // we have to use the pool instead of the direct client due to Katan nature,
             // the default instance of Jedis (without pool) is not thread-safe
-            cache = RedisCacheProvider(JedisPool(JedisPoolConfig(), host))
-            logger.info(locale["katan.redis.ready"])
+            cache = RedisCacheProvider(JedisPool(JedisPoolConfig(), redis.get("host", "localhost")))
+            logger.info(translator.translate("katan.redis.ready"))
         } catch (e: Throwable) {
             cache = UnavailableCacheProvider()
-            logger.error(locale["katan.redis.connection-failed"])
-            logger.error(e.message)
+            logger.error(translator.translate("katan.redis.connection-failed"))
         }
     }
 
     suspend fun start() {
-        logger.info(locale["katan.starting", Katan.VERSION, locale["katan.env.$environment"].toLowerCase(locale.locale)])
-        logger.info(locale["katan.platform", "${platform.os.name} ${platform.os.version}"])
-
-        hash = when (config.get("security.crypto.hash", "Bcrypt")) {
-            "BCrypt" -> BcryptHash()
-            else -> BcryptHash()
-        }
-
-        database()
+        logger.info(
+            translator.translate(
+                "katan.starting",
+                Katan.VERSION,
+                translator.translate("katan.env.$environment").toLowerCase(translator.locale)
+            )
+        )
+        logger.info(translator.translate("katan.platform", "$platform"))
         docker()
+        databaseManager = DatabaseManager(this)
+        databaseManager.connect()
+        pluginManager.loadPlugins()
+        serverManager = DockerServerManager(this, JDBCServersRepository(databaseManager.database as JDBCConnector))
+        accountManager = AccountManagerImpl(this, JDBCAccountsRepository(databaseManager.database as JDBCConnector))
         caching()
 
-        fun throwUnavailableRepository(
-            type: String
-        ): Nothing = throwSilent(
-            IllegalArgumentException("No $type repository available for ${database::class.simpleName}"),
-            logger
-        )
+        for (defaultPermission in DefaultPermissionKeys.DEFAULTS)
+            permissionManager.registerPermissionKey(defaultPermission)
 
-        eventBus = SimpleEventScope(LocalEventScope())
-        pluginManager = DefaultPluginManager(this)
-        accountManager = DefaultAccountManager(
-            this, when (database) {
-                is JDBCConnector -> JDBCAccountsRepository(this, database as JDBCConnector)
-                else -> throwUnavailableRepository("accounts")
-            }
-        )
-        serverManager = DockerServerManager(
-            this, when (database) {
-                is JDBCConnector -> JDBCServersRepository(this, database as JDBCConnector)
-                else -> throwUnavailableRepository("servers")
-            }
-        )
+        gameManager = GameManagerImpl(this)
+        pluginManager.callHandlers(KatanInit)
+        serverManager.loadServers()
+        dockerEventsListener.listen()
+
+        hash = when (val algorithm = config.getString("security.crypto.hash")) {
+            DEFAULT_VALUE, BcryptHash.NAME -> BcryptHash()
+            else -> serviceManager.get<Hash>().find {
+                it.name == algorithm
+            } ?: throw IllegalArgumentException("Unsupported hashing algorithm: $algorithm")
+        }
+        logger.info(translator.translate("katan.selected-hash", hash.name))
+        accountManager.loadAccounts()
+
+        pluginManager.callHandlers(KatanStarted)
     }
 
-    override suspend fun close() {
-
+    suspend fun close() {
+        pluginManager.disableAll()
+        dockerEventsListener.close()
+        logger.info("Good Bye :)")
     }
 
 }

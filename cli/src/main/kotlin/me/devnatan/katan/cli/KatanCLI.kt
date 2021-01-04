@@ -2,64 +2,74 @@ package me.devnatan.katan.cli
 
 import com.github.ajalt.clikt.core.PrintHelpMessage
 import com.github.ajalt.clikt.core.UsageError
-import com.github.ajalt.clikt.output.CliktConsole
-import kotlinx.coroutines.*
-import me.devnatan.katan.api.manager.AccountManager
-import me.devnatan.katan.api.manager.PluginManager
-import me.devnatan.katan.api.manager.ServerManager
-import me.devnatan.katan.core.KatanCore
+import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import me.devnatan.katan.api.Katan
+import me.devnatan.katan.api.account.AccountManager
+import me.devnatan.katan.api.cli.RegisteredCommand
+import me.devnatan.katan.api.server.ServerManager
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
-import java.util.concurrent.Executors
 
-class KatanCLI(val katan: KatanCore) {
+class KatanCLI(val katan: Katan) {
 
-    class Console(private val logger: Logger) : CliktConsole {
+    companion object {
 
-        // SLF4J logger already adds the line break
-        override val lineSeparator: String = ""
+        const val KATAN_COMMAND = "katan"
 
-        override fun print(text: String, error: Boolean) {
-            if (error) logger.error(text)
-            else logger.info(text)
-        }
-
-        override fun promptForLine(prompt: String, hideInput: Boolean) = when {
-            hideInput -> console.readPassword(prompt)?.let { String(it) }
-            else -> console.readLine(prompt)
-        }
-
-        companion object {
-            val console: java.io.Console by lazy { System.console() }
-        }
     }
 
-    val logger = LoggerFactory.getLogger(KatanCLI::class.java)!!
+    val logger: Logger = LoggerFactory.getLogger(KatanCLI::class.java)!!
 
     val serverManager: ServerManager get() = katan.serverManager
     val accountManager: AccountManager get() = katan.accountManager
-    val pluginManager: PluginManager get() = katan.pluginManager
+    val pluginManager get() = katan.pluginManager
 
     private var running = false
     private val command = KatanCommand(this)
-    val coroutineExecutor = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
-    val coroutineScope = CoroutineScope(CoroutineName("KatanCLI"))
-    val console = Console(logger)
+    val console = KatanConsole(logger)
 
+    // Clikt's localization is not recursive, so we will have
+    // to declare the object here and spread it out for commands.
+    val localization by lazy {
+        KatanLocalization(katan.translator)
+    }
+
+    /*
+        Due to Clikt (command framework) does not have support for coroutines
+        we have a CoroutineScope,  it is used in all commands and the dispatcher
+        is specified by the command itself. Canceling this scope cancels all pending tasks.
+
+        SupervisorJob is required in case of failure of any child, he will ensure that
+        in case that failure occurs the rest of the jobs that are being
+        performed in the background do not fail and the scope is not canceled.
+     */
+    val coroutineScope = CoroutineScope(SupervisorJob() + CoroutineName("KatanCLI"))
+
+    // TODO: wrap native help to plugins help command
     fun init() {
         running = true
         var line: String?
         do {
             line = readLine()
             try {
-                val args = line?.split(" ") ?: emptyList()
-                if (!args[0].equals("katan", true))
+                val args = line?.split(" ") ?: continue
+                val cmd = args.getOrNull(0) ?: continue
+                if (cmd.equals(KATAN_COMMAND, true)) {
+                    if (args.size == 1)
+                        throw PrintHelpMessage(command)
+
+                    command.parse(args.subList(1, args.size))
                     continue
+                }
 
-                if (args.size == 1)
-                    throw PrintHelpMessage(command)
+                // search for plugins commands
+                val match = katan.commandManager.getCommand(cmd) as? RegisteredCommand
+                    ?: throw PrintHelpMessage(command)
 
-                command.parse(args.subList(1, args.size))
+                katan.commandManager.executeCommand(match.plugin, match, cmd, args.subList(1, args.size).toTypedArray())
             } catch (e: PrintHelpMessage) {
                 logger.info(e.command.getFormattedHelp())
             } catch (e: UsageError) {
@@ -71,9 +81,12 @@ class KatanCLI(val katan: KatanCore) {
     }
 
     fun close() {
-        if (coroutineExecutor.isActive)
-            coroutineScope.cancel()
-        coroutineExecutor.close()
+        check(running)
+        coroutineScope.cancel()
+    }
+
+    fun translate(key: String, vararg args: Any): String {
+        return katan.translator.translate(key, *args)
     }
 
 }

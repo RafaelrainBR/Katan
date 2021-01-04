@@ -4,23 +4,20 @@ import kotlinx.coroutines.Dispatchers
 import me.devnatan.katan.common.util.replaceEach
 import me.devnatan.katan.core.database.DatabaseConnector
 import me.devnatan.katan.core.database.DatabaseSettings
+import me.devnatan.katan.core.database.LocalDatabaseSettings
 import me.devnatan.katan.core.database.jdbc.entity.AccountsTable
+import me.devnatan.katan.core.database.jdbc.entity.ServerCompositionsTable
 import me.devnatan.katan.core.database.jdbc.entity.ServerHoldersTable
 import me.devnatan.katan.core.database.jdbc.entity.ServersTable
 import org.jetbrains.exposed.sql.Database
 import org.jetbrains.exposed.sql.SchemaUtils
 import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
-import org.slf4j.LoggerFactory
 
 abstract class JDBCConnector(
     override val name: String,
     override val driver: String,
     override val url: String
 ) : DatabaseConnector {
-
-    companion object {
-        val logger = LoggerFactory.getLogger(JDBCConnector::class.java)!!
-    }
 
     lateinit var database: Database
 
@@ -41,7 +38,8 @@ abstract class JDBCConnector(
             SchemaUtils.create(
                 AccountsTable,
                 ServersTable,
-                ServerHoldersTable
+                ServerHoldersTable,
+                ServerCompositionsTable
             )
         }
     }
@@ -104,7 +102,7 @@ open class JDBCRemoteSettings(
 open class JDBCLocalSettings(
     val file: String,
     override val connectionProperties: Map<String, String>,
-) : JDBCSettings {
+) : JDBCSettings, LocalDatabaseSettings {
 
     override fun toString(): String {
         return file

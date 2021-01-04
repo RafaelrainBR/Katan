@@ -6,66 +6,117 @@ import com.github.ajalt.clikt.parameters.options.default
 import com.github.ajalt.clikt.parameters.options.option
 import com.github.ajalt.clikt.parameters.options.required
 import com.github.ajalt.clikt.parameters.options.split
+import com.github.ajalt.clikt.parameters.types.int
+import com.github.ajalt.clikt.parameters.types.long
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.channels.sendBlocking
 import me.devnatan.katan.api.annotations.InternalKatanApi
+import me.devnatan.katan.api.annotations.UnstableKatanApi
+import me.devnatan.katan.api.game.GameVersion
 import me.devnatan.katan.api.server.*
 import me.devnatan.katan.cli.KatanCLI
 import me.devnatan.katan.cli.err
-import me.devnatan.katan.common.server.ServerCompositionsImpl
-import me.devnatan.katan.common.server.UninitializedServer
-import me.devnatan.katan.core.server.compositions.image.DockerImageComposition
-import me.devnatan.katan.core.server.compositions.image.DockerImageOptions
+import me.devnatan.katan.common.KatanTranslationKeys.CLI_ALIAS_SERVER_CREATE
+import me.devnatan.katan.common.KatanTranslationKeys.CLI_ARG_HELP_SERVER_NAME
+import me.devnatan.katan.common.KatanTranslationKeys.CLI_ARG_LABEL_SERVER_NAME
+import me.devnatan.katan.common.KatanTranslationKeys.CLI_HELP_SERVER_CREATE
+import me.devnatan.katan.common.KatanTranslationKeys.CLI_SERVER_NOT_FOUND
+import me.devnatan.katan.common.impl.server.ServerGameImpl
 
 class ServerCreateCommand(private val cli: KatanCLI) : CliktCommand(
-    name = "create",
-    help = "Creates a new server"
+    name = cli.translate(CLI_ALIAS_SERVER_CREATE),
+    help = cli.translate(CLI_HELP_SERVER_CREATE)
 ) {
 
-    private val name by argument(help = "Server name")
-    private val image by option("-i", "--image", help = "The Docker image to be used.").required()
+    private val name by argument(
+        cli.translate(CLI_ARG_LABEL_SERVER_NAME),
+        cli.translate(CLI_ARG_HELP_SERVER_NAME)
+    )
+
+    private val game by option("-g", "--game", help = "A game that is supported by Katan.").required()
+    private val host by option(
+        "-h",
+        "--host",
+        help = "Remote server connection address."
+    ).default("0.0.0.0")
+
+    private val port by option("-p", "--port", help = "Remote server connection port.").int().required()
+    private val image by option("-i", "--image", help = "Docker image that will be used to build the server.")
     private val compositions by option(
         "-w",
         "--with",
-        help = "List of composition definitions to be applied (comma-separated)"
+        help = "List of compositions to be applied to the server (comma-separated)."
     ).split(",").default(emptyList())
+    private val memory by option("-m", "--memory", help = "Amount of memory to allocate on the server (in MB).").long()
+        .default(1024)
 
-    @OptIn(ExperimentalCoroutinesApi::class, InternalKatanApi::class)
+    @OptIn(ExperimentalCoroutinesApi::class, InternalKatanApi::class, UnstableKatanApi::class)
     override fun run() {
         if (cli.serverManager.existsServer(name))
-            return err(
-                "There is already a server with that name, try another one.",
-                "Use \"katan server ls\" to find out which servers already exist."
+            return err(cli.translate(CLI_SERVER_NOT_FOUND, name))
+
+        val gameTarget = game.split(":")
+        val target = cli.katan.gameManager.getGame(gameTarget[0])
+            ?: return err("Game \"$game\" is invalid or unsupported.")
+
+        val version: GameVersion? = if (gameTarget.size > 1) {
+            val gameVersion = gameTarget[1].replace("-", " ")
+            target.versions.find { it.name.equals(gameVersion, true) }
+                ?: return err("Game version \"${gameVersion}\" not found for ${target.name} (available: ${target.versions.joinToString { it.name }}).")
+        } else null
+
+        if (port !in target.settings.ports)
+            return err("The port $port does not respect the ${target.name}'s default port range (${target.settings.ports}).")
+
+        val targetImage = (image ?: (version?.image ?: target.image)) ?: return err("No image was provided.")
+
+        val completion = Job()
+        runBlocking(CoroutineName("KatanCLI::server-create-main")) {
+            val server =
+                cli.katan.serverManager.prepareServer(name, ServerGameImpl(target.type, version), host, port.toShort())
+
+            completion.invokeOnCompletion { error ->
+                if (error == null) {
+                    cli.coroutineScope.launch(CoroutineName("KatanCLI::server-create")) {
+                        cli.serverManager.addServer(server)
+                        cli.serverManager.registerServer(server)
+                        cli.serverManager.inspectServer(server)
+                    }
+                }
+            }
+
+            server.compositions[DockerImageServerComposition] = cli.katan.serverManager.getCompositionFactory(DockerImageServerComposition)!!.create(
+                DockerImageServerComposition,
+                DockerImageServerComposition.Options(
+                    host,
+                    port,
+                    memory,
+                    targetImage,
+                    version?.environment?.let {
+                        target.environment + it
+                    } ?: target.environment
+                )
             )
 
-        runBlocking(CoroutineName("KatanCLI::server-create-main")) {
-            var server: Server = UninitializedServer(name)
-            echo("Creating server \"$name\"...")
-            (server.compositions as ServerCompositionsImpl)[DockerImageComposition] =
-                cli.katan.serverManager.compositionFactory.create(
-                    DockerImageComposition.Key,
-                    DockerImageOptions(image)
-                )
-
-            cli.coroutineScope.launch(cli.coroutineExecutor + CoroutineName("KatanCLI::server-create-job")) {
-                server = cli.serverManager.createServer(server)
+            cli.coroutineScope.launch(completion + CoroutineName("KatanCLI::server-create-job")) {
+                cli.serverManager.createServer(server)
             }.join()
 
             if (compositions.isNotEmpty()) {
                 val length = compositions.size
-                echo("Applying $length custom compositions...")
+                echo("Applying $length compositions...")
 
                 val applied = arrayListOf<ServerComposition.Key<*>>()
                 for ((index, name) in compositions.withIndex()) {
                     val phase = "[${index + 1}/$length]"
-                    val factory = cli.serverManager.getCompositionFactoryApplicableFor(name)
+                    val factory = cli.serverManager.getCompositionFactory(name)
                     if (factory == null) {
                         err("$phase Factory not found for composition $name.")
                         continue
                     }
 
-                    val key = factory.getKey(name)
+                    val key = factory[name]
                     if (key == null) {
                         err("$phase $name is registered but not applicable for the specified this factory")
                         continue
@@ -118,7 +169,7 @@ class ServerCreateCommand(private val cli: KatanCLI) : CliktCommand(
                     }
 
                     val cancellationHandler = Job()
-                    val keyName = factory.getKeyName(key)!!
+                    val keyName = factory[key]!!
 
                     /*
                         This `handler` will help us finalize the channel subscription for this composition
@@ -148,15 +199,7 @@ class ServerCreateCommand(private val cli: KatanCLI) : CliktCommand(
                 }
             }
 
-            cli.serverManager.addServer(server)
-
-            echo("Registering server....")
-            cli.serverManager.registerServer(server)
-
-            echo("Inspecting server...")
-            cli.serverManager.inspectServer(server)
-
-            echo("Server $name created successfully!")
+            completion.complete()
         }
     }
 }

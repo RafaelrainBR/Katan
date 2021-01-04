@@ -8,7 +8,6 @@ import io.ktor.util.*
 import me.devnatan.katan.api.Katan
 import me.devnatan.katan.common.util.exportResource
 import me.devnatan.katan.common.util.get
-import me.devnatan.katan.webserver.environment.Environment
 import org.slf4j.LoggerFactory
 import java.util.concurrent.TimeUnit
 
@@ -20,41 +19,28 @@ class KatanWS(val katan: Katan) {
 
     lateinit var server: ApplicationEngine
     lateinit var environment: Environment
-    lateinit var config: Config
-    val accountManager get() = katan.accountManager
-    lateinit var internalAccountManager: WSAccountManager
+    val config: Config = ConfigFactory.load(ConfigFactory.parseFile(exportResource("webserver.conf")))!!
+    lateinit var internalAccountManager: TokenManager
+    val enabled = config.get("enabled", false)
 
-    private var _enabled = false
-    val enabled: Boolean
-        get() {
-            load()
-            _enabled = config.get("enabled", true)
-            return _enabled
-        }
+    val accountManager get() = katan.accountManager
+    val serverManager get() = katan.serverManager
 
     @OptIn(KtorExperimentalAPI::class)
     fun init() {
-        load()
-        logger.info("Creating environment...")
+        logger.info("Starting Web Server...")
+        internalAccountManager = TokenManager(this)
         environment = Environment(this)
         environment.start()
         server = embeddedServer(Jetty, environment.environment)
-        logger.info("Starting server...")
         server.start()
     }
 
-
-    private fun load() {
-        if (!::config.isInitialized)
-            config = ConfigFactory.load(ConfigFactory.parseFile(exportResource("webserver.conf")))!!
-        internalAccountManager = WSAccountManager(this)
-    }
-
     suspend fun close() {
-        logger.info("Closing environment...")
+        if (!::environment.isInitialized) return
         environment.close()
 
-        logger.info("Stopping server...")
+        logger.info("Shutting down...")
         val shutdown = config.getConfig("deployment.shutdown")
         server.stop(
             shutdown.get("gracePeriod", 1000),

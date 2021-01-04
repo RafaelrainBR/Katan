@@ -1,40 +1,61 @@
 package me.devnatan.katan.api.server
 
+import me.devnatan.katan.api.game.Game
+
+/**
+ * Represents a server created by Katan, servers can be
+ * composed (using Server Compositions API) and modified dynamically.
+ */
 interface Server {
 
     /**
-     * Number for unique server identification.
+     * Returns the server id.
      */
     val id: Int
 
     /**
-     * Server name.
+     * Returns the server name.
      */
     var name: String
 
     /**
-     * Accounts that have permissions on that server.
+     * Returns all accounts that have permissions on that server.
      */
     val holders: MutableSet<ServerHolder>
 
     /**
-     * The container linked to the server.
+     * Returns the [ServerContainer] linked to this server.
      */
-    var container: ServerContainer
+    val container: ServerContainer
 
     /**
-     * Remote server address search results.
+     * Returns the server's temporarily metadata values.
      */
-    val query: ServerQuery
+    val metadata: MutableMap<String, Any>
 
     /**
-     * Current server state.
+     * Returns the current server state.
      */
     var state: ServerState
 
     /**
-     * Server compositions.
+     * Returns the server compositions container.
      */
-    var compositions: ServerCompositions
+    val compositions: ServerCompositions
+
+    /**
+     * Returns the [Game] that this server is targeting.
+     */
+    val game: ServerGame
+
+    /**
+     * Returns the server remote connection address.
+     */
+    val host: String
+
+    /**
+     * Returns the server remote connection port.
+     */
+    val port: Short
 
 }

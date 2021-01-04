@@ -1,31 +1,58 @@
 package me.devnatan.katan.cli.commands.account
 
 import com.github.ajalt.clikt.core.CliktCommand
-import com.github.ajalt.clikt.parameters.options.flag
-import com.github.ajalt.clikt.parameters.options.option
+import com.jakewharton.picnic.TextAlignment
+import com.jakewharton.picnic.table
 import me.devnatan.katan.cli.KatanCLI
-import me.devnatan.katan.common.account.SecureAccount
+import me.devnatan.katan.cli.render
+import me.devnatan.katan.common.KatanTranslationKeys.CLI_ACCOUNT_LIST
+import me.devnatan.katan.common.KatanTranslationKeys.CLI_ACCOUNT_LIST_ID
+import me.devnatan.katan.common.KatanTranslationKeys.CLI_ACCOUNT_LIST_REGISTERED_AT
+import me.devnatan.katan.common.KatanTranslationKeys.CLI_ACCOUNT_LIST_USERNAME
+import me.devnatan.katan.common.KatanTranslationKeys.CLI_ALIAS_ACCOUNT_LIST
+import me.devnatan.katan.common.KatanTranslationKeys.CLI_HELP_ACCOUNT_LIST
+import me.devnatan.katan.common.util.dateTimeFormatter
 
 class AccountListCommand(private val cli: KatanCLI) : CliktCommand(
-    name = "ls",
-    help = "Lists all registered accounts."
+    name = cli.translate(CLI_ALIAS_ACCOUNT_LIST),
+    help = cli.translate(CLI_HELP_ACCOUNT_LIST)
 ) {
-
-    private val detailed by option("-d", "--detailed").flag()
 
     override fun run() {
         val accounts = cli.accountManager.getAccounts()
-        echo("List of all accounts (${accounts.size}):")
-        for (account in accounts) {
-            echo(buildString {
-                if (detailed)
-                    append("${account.id} - ")
+        render(table {
+            cellStyle {
+                paddingLeft = 1
+                paddingRight = 1
+                borderLeft = true
+                borderRight = true
+            }
 
-                append(account.username)
-                if (account is SecureAccount && account.password.isNotEmpty())
-                    append(" (with password)")
-            })
-        }
+            header {
+                cellStyle { alignment = TextAlignment.BottomCenter }
+                row {
+                    cell(cli.translate(CLI_ACCOUNT_LIST, accounts.size)) {
+                        columnSpan = 4
+                        paddingBottom = 1
+                    }
+                }
+
+                row("#",
+                    cli.translate(CLI_ACCOUNT_LIST_ID),
+                    cli.translate(CLI_ACCOUNT_LIST_USERNAME),
+                    cli.translate(CLI_ACCOUNT_LIST_REGISTERED_AT)
+                )
+            }
+
+            body {
+                for ((index, account) in accounts.sortedByDescending { it.registeredAt }.withIndex()) {
+                    row(index + 1, account.id.toString().substringBefore("-"),
+                        account.username,
+                        dateTimeFormatter.format(account.registeredAt),
+                    )
+                }
+            }
+        })
     }
 
 }
